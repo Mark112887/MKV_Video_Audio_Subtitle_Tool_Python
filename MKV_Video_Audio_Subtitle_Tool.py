@@ -1246,6 +1246,7 @@ class App:
             'total': total,
             'ok': ok,
             'fail': fail,
+            'file_actions_count': 0,   # how many files needed actual work across all files
             # Per-file fields filled when we reach BUILD_FILE:
             'fp': None,         # file path being processed
             'fname': None,
@@ -1342,19 +1343,33 @@ class App:
 
                 # ─── DAR validation: compare against desired ───
                 skip_dar = False
+                dar_display_str = ""
                 if cur_dar_w > 0 and cur_dar_h > 0:
+                    dar_display_str = f"{cur_dar_w}:{cur_dar_h}"
                     try:
                         if self._matches_dar(cur_dar_w, cur_dar_h, dar_str):
                             skip_dar = True
-                            validation_notes.append(f"DAR already {cur_dar_w}:{cur_dar_h} (skipped)")
                     except ValueError:
-                        pass  # malformed dar_str — will be caught by parse_dar below anyway
+                        pass
+                elif info_dict and (pw := info_dict.get('width') or 0) > 0 and (ph := info_dict.get('height') or 0) > 0:
+                    # Fallback to pixel resolution when no actual display dimensions stored.
+                    dar_display_str = f"{pw}:{ph}"
+                    try:
+                        if self._matches_dar(pw, ph, dar_str):
+                            skip_dar = True
+                    except ValueError:
+                        pass
+
+                if skip_dar and dar_display_str:
+                    validation_notes.append(f"DAR already {dar_display_str} (skipped)")
 
                 # ─── CC validation flag for later FFmpeg step ───
-                skip_cc = False
-                if remove_cc and not has_cc_from_file:
-                    skip_cc = True
-                    validation_notes.append("CC: none present (skipped)")
+                skip_cc = True  # default to "no CC work needed" unless user explicitly requested removal
+                if remove_cc:
+                    if has_cc_from_file:
+                        skip_cc = False  # CC exists — we'll need to remove it
+                    else:
+                        validation_notes.append("CC: none present (skipped)")
 
                 fname = os.path.basename(fp)
                 output_path = os.path.join(self.output_dir,
@@ -1376,6 +1391,28 @@ class App:
                     'validation_notes': validation_notes,
                 })
 
+                # ─── Pre-flight: if all operations skipped for this file — skip mkvmerge entirely ───
+                if skip_dar and not remove_subs and skip_cc:
+                    self.root.after(0, lambda n=fname, ix=idx + 1, t=total:
+                                   self._append_text(f"[{ix}/{t}] {n} — no action necessary\n", color="#565f89"))
+                    # Update overall progress bar (just the chunk) without filling it
+                    pct_before = int(idx * 100 / total)
+                    ow = max(2, (self.over_canvas.winfo_width() - 2) if self.over_canvas.winfo_width() > 0 else 518)
+                    fw_ov = max(2, int(ow * pct_before / 100.0))
+                    self.root.after(0, lambda fw=fw_ov: (
+                        self.over_canvas.delete("fill"),
+                        self.over_canvas.create_rectangle(1, 2, 1 + fw, 13, fill="#7ab5cf", tag="fill")
+                    ))
+                    self.root.after(0, lambda pd=pct_before: self.over_text.config(text=f"Overall: {pd}%"))
+                    # Keep bars at 0% for this file
+                    self.root.after(0, lambda: self.cur_canvas.create_rectangle(1, 2, 3, 13, fill="#1e2130", outline=""))
+                    self.root.after(0, lambda: self.cur_text.config(text=f"Current File: 0%"))
+                    # No action needed — report via _process_file_result (no cb_ctx = bars stay at 0)
+                    s['skip_this_file'] = True
+                    s['step'] = 'MKV_POLL'  # fast-forward to MKV_DONE path which calls _process_file_result
+                    self.root.after(0, self._process_step)
+                    return
+
                 # UI updates on main thread
                 self.root.after(0, lambda n=fname, ix=idx + 1, t=total:
                                self._append_text(f"[{ix}/{t}] {n} …\n", color="#c0caf5"))
@@ -1391,6 +1428,7 @@ class App:
                 self.root.after(0, lambda pd=pct_before: self.over_text.config(text=f"Overall: {pd}%"))
 
                 # ─── Start mkvmerge subprocess ───
+                s['file_actions_count'] = s.get('file_actions_count', 0) + 1
                 mkvmerge = _get_mkvmerge()
                 s['mux_proc'] = None
                 s['mux_buf'] = b''
@@ -1578,7 +1616,12 @@ class App:
             # ─── MKV_POLL / MKV_DONE: check if muxing completed ───
             elif step in ('MKV_POLL', 'MKV_DONE'):
                 proc = s.get('mux_proc')
-                if proc is None or proc.poll() is None:
+                if proc is None:
+                    # mux was never started — all ops were skipped pre-flight.
+                    # Finish batch now so we don't loop forever.
+                    self.root.after(50, self._process_complete)
+                    return
+                if proc.poll() is None:
                     # Still running — poller will handle updates.  Check back.
                     self.root.after(100, self._process_step)
                     return
@@ -1648,6 +1691,25 @@ class App:
                 output_path = s.get('output_path', '')
                 if not os.path.exists(output_path):
                     self._process_file_result(False, "mkvmerge produced no output file", cb_ctx=mux_cb_ctx)
+                    return
+
+                # ─── If all operations are skipped — nothing was needed ───
+                all_skipped = (s.get('skip_dar') and not s['remove_subs'] and s.get('skip_cc', False))
+                if all_skipped:
+                    # Clear the output file since it's identical to input
+                    try:
+                        os.remove(output_path)
+                    except OSError:
+                        pass
+                    self.root.after(0, lambda: (
+                        self.cur_canvas.create_rectangle(1, 2, 3, 13, fill="#1e2130", outline=""),
+                        self.over_canvas.create_rectangle(1, 2, 3, 13, fill="#1e2130", outline=""),
+                    ))
+                    self.root.after(0, lambda: self.cur_text.config(text=f"Current File: 0%"))
+                    self.root.after(0, lambda: self.over_text.config(text="Overall: 0%"))
+                    # Decrement the action counter since mkvmerge wasn't needed for this file
+                    s['file_actions_count'] = max(0, s.get('file_actions_count', 1) - 1)
+                    self._process_file_result(True, "No action necessary", cb_ctx=None)
                     return
 
                 # ─── FFmpeg CC removal step (only if CC actually exists) ───
@@ -1863,6 +1925,28 @@ class App:
         else:
             s['fail'] += 1
 
+        # Track whether any file had actual work (not "no action necessary")
+        if ok and not s.get('skip_this_file'):
+            has_notes = msg.find("no action necessary") >= 0 or msg.find("— no action") >= 0
+            if not has_notes:
+                notes = s.get('validation_notes', [])
+                if not any('(skipped)' in n for n in notes) and not s.get('skip_dar'):
+                    pass  # mkvmerge ran — count tracked below
+
+        # Decide whether progress bars should be updated for this file.
+        # If ALL operations were skipped pre-flight, keep bars at zero.
+        # For post-mkvmerge safety-net skips, still let bars update but _process_complete will fix them later.
+        was_pre_flight_skip = s.get('skip_this_file')
+
+        if was_pre_flight_skip:
+            # No real progress — only advance the index and schedule complete.
+            s['idx'] += 1
+            if s['idx'] < s['total']:
+                self.root.after(50, self._process_step)
+            else:
+                self.root.after(50, self._process_complete)
+            return
+
         # Update current file label with captured percentage
         pct = cb_ctx.get('pct', 0) if cb_ctx else 0
         self.root.after(0, lambda p=pct: self.cur_text.config(text=f"Current File: {p}%") if p > 0 else None)
@@ -1904,6 +1988,9 @@ class App:
         fail = s.get('fail', 0)
         total = s.get('total', 0)
 
+        # Track whether any actual work was done (across ALL files, not just last).
+        all_skipped = s.get('file_actions_count', 0) == 0
+
         # Clear any running subprocess
         if getattr(self, '_mux_proc', None) is not None and self._mux_proc.poll() is None:
             try:
@@ -1911,18 +1998,29 @@ class App:
             except Exception:
                 pass
 
-        # Final canvas updates (100% overall)
-        ow = max(2, (self.over_canvas.winfo_width() - 2) if self.over_canvas.winfo_width() > 0 else 518)
-        fw_ov = max(2, int(ow * 100 / 100.0))
-        self.cur_canvas.create_rectangle(1, 2, 1 + fw_ov, 13, fill="#7ab5cf", outline="")
-        self.over_canvas.create_rectangle(1, 2, 1 + fw_ov, 13, fill="#7ab5cf", outline="")
+        if all_skipped:
+            # Nothing was needed — keep bars at 0, show informative message.
+            ow = max(2, (self.over_canvas.winfo_width() - 2) if self.over_canvas.winfo_width() > 0 else 518)
+            fw_ov = max(2, int(ow * 0 / 100.0))
+            self.cur_canvas.create_rectangle(1, 2, 3, 13, fill="#1e2130", outline="")
+            self.over_canvas.create_rectangle(1, 2, 3, 13, fill="#1e2130", outline="")
+            self.root.after(0, lambda: self.cur_text.config(text="Current File: 0%"))
+            self.root.after(0, lambda: self.over_text.config(text=f"Overall: 0%", fg="#7aa2f7"))
+            self.root.after(0, lambda: self._append_text("\n═══ no action necessary ═══\n", color="#565f89"))
+            self.root.after(0, lambda: self.info_var.set("No action necessary"))
+        else:
+            # Final canvas updates (100% overall)
+            ow = max(2, (self.over_canvas.winfo_width() - 2) if self.over_canvas.winfo_width() > 0 else 518)
+            fw_ov = max(2, int(ow * 100 / 100.0))
+            self.cur_canvas.create_rectangle(1, 2, 1 + fw_ov, 13, fill="#7ab5cf", outline="")
+            self.over_canvas.create_rectangle(1, 2, 1 + fw_ov, 13, fill="#7ab5cf", outline="")
 
-        # Schedule remaining UI updates on main thread (after any pending events)
-        self.root.after(0, lambda: self._append_text(
-            f"\n═══ complete: {ok} ok, {fail} failed ═══\n", color="#7aa2f7"))
-        self.root.after(0, lambda o=ok, f=fail: self.info_var.set(f"Done — ✓ {o}   ✗ {f}"))
-        # Reset overall label text color back to default blue after processing completes
-        self.root.after(0, lambda: self.over_text.config(fg="#7aa2f7"))
+            # Schedule remaining UI updates on main thread (after any pending events)
+            self.root.after(0, lambda: self._append_text(
+                f"\n═══ complete: {ok} ok, {fail} failed ═══\n", color="#7aa2f7"))
+            self.root.after(0, lambda o=ok, f=fail: self.info_var.set(f"Done — ✓ {o}   ✗ {f}"))
+            # Reset overall label text color back to default blue after processing completes
+            self.root.after(0, lambda: self.over_text.config(fg="#7aa2f7"))
 
         # Clear state and re-enable controls
         self._proc_state = {}
