@@ -292,8 +292,10 @@ def probe_mkv(mkv_path):
     in_codec_private = False
 
     lines = text.splitlines()
-    for i, line in enumerate(lines):
-        stripped = line.strip()
+
+    # First pass: collect track blocks using tree markers (same approach as probe_audio_tracks).
+    for i, raw_line in enumerate(lines):
+        stripped = raw_line.strip()
 
         # Track count
         if 'Number of tracks' in stripped:
@@ -301,66 +303,124 @@ def probe_mkv(mkv_path):
             if m:
                 total_tracks = int(m.group(1))
 
-        # Video track block
-        if stripped.startswith('Track number:') and ': video' in stripped:
-            m = re.search(r'Track number (\d+)', line)
-            if m:
-                video_track_ids.append(int(m.group(1)))
+    track_blocks = []
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        # Detect start of a track block via tree markers.
+        if re.search(r'\|\s*\+\s+Track\s+number:', line):
+            m_num = re.search(r'Track number:\s*(\d+)', line)
+            if not m_num:
+                i += 1
+                continue
+            track_num = int(m_num.group(1))
 
-        # Subtitle track detection (SubRip, ASS, etc.)
-        if 'Track number:' in stripped and ('Subtitles' in stripped or 'Text' in stripped):
-            m = re.search(r'Track number (\d+)', line)
-            if m:
-                subtitle_track_ids.append(int(m.group(1)))
+            # Extract the parenthetical mkvmerge ID.
+            m_mkvmerge_id = re.search(r'mkvmerge.*:\s*(\d+)', line)
+            merge_id = int(m_mkvmerge_id.group(1)) if m_mkvmerge_id else track_num
 
-        # Actual display dimensions (the value mkvpropedit uses for DAR)
-        if stripped.startswith('Actual display width:'):
-            m = re.search(r'(\d+)', stripped)
-            if m:
-                actual_display_w = int(m.group(1))
-        elif stripped.startswith('Actual display height:'):
-            m = re.search(r'(\d+)', stripped)
-            if m:
-                actual_display_h = int(m.group(1))
+            track_type = None
+            codec_id = ''
+            in_codec_private = False
+            j = i + 1
+            while j < len(lines):
+                raw_j = lines[j]
+                s = raw_j.strip()
+                # New track block or top-level section ends the current block.
+                if re.search(r'\|\s*\+\s+Track\s+number:', raw_j) or '| Tracks' in raw_j or '| + Segment' in raw_j:
+                    break
+                m_type = re.search(r'Track type:\s*(\w+)', s)
+                if m_type:
+                    track_type = m_type.group(1).lower()
+                if not codec_id:
+                    m_codec = re.search(r'Codec ID:\s*(\S+)', s)
+                    if m_codec:
+                        codec_id = m_codec.group(1)
+                # Collect codec private data lines for CC detection.
+                if 'Codec private type' in s:
+                    in_codec_private = True
+                elif in_codec_private:
+                    lower = s.lower()
+                    if 'eia-608' in lower or 'eia-708' in lower:
+                        has_cc = True
+                    elif 'hdmv_pgs_subtitle' in lower or 'hevc_metadata' in lower:
+                        has_cc = True
+                    # Stop scanning codec_private when hit a new top-level field.
+                    if not s.startswith((' ', '\t')) and 'Codec private' not in s:
+                        in_codec_private = False
+                j += 1
 
-        # Detect Closed Captions in codec private data.
-        # mkvinfo outputs "Codec private type:" followed by hex/ASCII on next lines.
-        # Common CC indicators: EIA-608, EIA-708, HDMV_PGS, HEVC metadata
-        if stripped.startswith('Codec private type'):
-            in_codec_private = True
-            continue
-        if in_codec_private:
-            lower = stripped.lower()
-            if 'eia-608' in lower or 'eia-708' in lower:
-                has_cc = True
-            elif 'hdmv_pgs_subtitle' in lower or 'hevc_metadata' in lower:
-                has_cc = True
-            # Stop scanning codec_private when hit a new top-level field
-            if not stripped.startswith((' ', '\t')) and 'Codec private' not in stripped:
-                in_codec_private = False
+            if track_type == 'video':
+                video_track_ids.append(merge_id)
+            elif track_type in ('subtitles', 'subtitle', 'text'):
+                subtitle_track_ids.append(merge_id)
+                # Also check codec ID for CC indicators on subtitle tracks.
+                cid_upper = codec_id.upper()
+                if cid_upper.startswith('S_EIA') or cid_upper.startswith('S_HDMV_PGS'):
+                    has_cc = True
 
-    # mkvinfo doesn't report raw pixel dimensions directly — fall back to mkvmerge -i
-    for line in lines:
-        stripped = line.strip()
-        m_w = re.search(r'(\d{3,})\s*x\s*(\d{3,})', stripped)
-        if m_w and ('Video' in line or 'Resolution' in line):
-            width = int(m_w.group(1))
-            height = int(m_w.group(2))
-            break
+        i += 1
 
-    # Fallback: check mkvmerge -i output (more structured)
-    if width is None or height is None:
-        mkvmerge = _get_mkvmerge()
-        if mkvmerge:
-            rc, text = run_mkvtl([mkvmerge, '-i', mkv_path], timeout=30)
-            if rc == 0:
-                for line in text.splitlines():
-                    if 'Video:' in line and 'Track ID' in line:
-                        m_w = re.search(r'(\d{3,})\s*x\s*(\d{3,})', line)
-                        if m_w:
-                            width = int(m_w.group(1))
-                            height = int(m_w.group(2))
+    # ── Extract display & pixel dimensions (matches C++ MkvProber logic) ──────
+    # Display dimensions — explicit DAR metadata (may be absent in many MKV files).
+    disp_w = disp_h = pix_w = pix_h = 0
+    width_prefixes = ['Display width', 'Pixel width', 'Frame width']
+    height_prefixes = ['Display height', 'Pixel height', 'Frame height']
+
+    for raw_line in lines:
+        t = raw_line.strip()
+
+        # Display dimensions (check only if not already found)
+        if disp_w == 0:
+            for prefix in width_prefixes:
+                idx = t.lower().find(prefix.lower())
+                if idx >= 0:
+                    after = t[idx + len(prefix):].strip()
+                    if after.startswith(':'):
+                        val = int(after[1:].strip())
+                        if val > 0:
+                            disp_w = val
                             break
+        if disp_h == 0:
+            for prefix in height_prefixes:
+                idx = t.lower().find(prefix.lower())
+                if idx >= 0:
+                    after = t[idx + len(prefix):].strip()
+                    if after.startswith(':'):
+                        val = int(after[1:].strip())
+                        if val > 0:
+                            disp_h = val
+                            break
+
+        # Pixel dimensions — bare "Width:" / "Height:" (must not be preceded by a word).
+        if pix_w == 0:
+            wid_idx = t.lower().find('width:')
+            if wid_idx >= 0:
+                # Reject if preceded by alphabetic char or ends with "Pixel"/"Display".
+                before_word = t[:wid_idx].strip().split()[-1] if t[:wid_idx].strip() else ''
+                has_prefix = (wid_idx > 0 and t[wid_idx - 1].isalpha()) or \
+                             before_word.lower() in ('pixel', 'display', 'frame')
+                if not has_prefix:
+                    val = int(t[wid_idx + 6:].strip())
+                    if val > 2:
+                        pix_w = val
+
+        if pix_h == 0:
+            hid_idx = t.lower().find('height:')
+            if hid_idx >= 0:
+                before_word = t[:hid_idx].strip().split()[-1] if t[:hid_idx].strip() else ''
+                has_prefix = (hid_idx > 0 and t[hid_idx - 1].isalpha()) or \
+                             before_word.lower() in ('pixel', 'display', 'frame')
+                if not has_prefix:
+                    val = int(t[hid_idx + 7:].strip())
+                    if val > 2:
+                        pix_h = val
+
+    # Prefer display dimensions (what mkvpropedit uses for DAR), fallback to pixel.
+    actual_display_w = disp_w or None
+    actual_display_h = disp_h or None
+    width = pix_w or width
+    height = pix_h or height
 
     return {
         'width': width or 0,
