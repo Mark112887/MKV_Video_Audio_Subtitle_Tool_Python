@@ -1,6 +1,6 @@
-# MKV Video Audio & Subtitle Tool
+# MKV Video Audio & Subtitle Tool — Python
 
-A desktop application for processing MKV video files — individually or in batch — changing display aspect ratio, removing subtitles and closed captions, and filtering audio tracks — all without re-encoding. Powered by mkvtoolnix for fast, lossless container operations.
+A desktop application for processing MKV video files — individually or in batch — changing display aspect ratio, removing subtitles and closed captions, and filtering audio tracks — all without re-encoding. Powered by mkvtoolnix for fast, lossless container operations. Built with Python and tkinter.
 
 <div align="center">
 
