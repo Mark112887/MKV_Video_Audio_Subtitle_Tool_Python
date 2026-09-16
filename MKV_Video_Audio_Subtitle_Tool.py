@@ -273,7 +273,8 @@ def probe_mkv(mkv_path):
     """Probe an MKV file with mkvinfo.
 
     Returns (info_dict | None, error_msg | None).
-    info_dict keys: width, height, video_track_ids, subtitle_track_ids, total_tracks
+    info_dict keys: width, height, video_track_ids, subtitle_track_ids, total_tracks,
+                    has_cc, actual_display_w, actual_display_h
     """
     mkvinfo = _get_mkvinfop()
     if mkvinfo is None:
@@ -283,10 +284,12 @@ def probe_mkv(mkv_path):
     if rc != 0:
         return None, f"mkvinfo failed: {text}"
 
-    width = height = None
+    width = height = actual_display_w = actual_display_h = None
     video_track_ids = []
     subtitle_track_ids = []
+    has_cc = False
     total_tracks = 0
+    in_codec_private = False
 
     lines = text.splitlines()
     for i, line in enumerate(lines):
@@ -309,6 +312,32 @@ def probe_mkv(mkv_path):
             m = re.search(r'Track number (\d+)', line)
             if m:
                 subtitle_track_ids.append(int(m.group(1)))
+
+        # Actual display dimensions (the value mkvpropedit uses for DAR)
+        if stripped.startswith('Actual display width:'):
+            m = re.search(r'(\d+)', stripped)
+            if m:
+                actual_display_w = int(m.group(1))
+        elif stripped.startswith('Actual display height:'):
+            m = re.search(r'(\d+)', stripped)
+            if m:
+                actual_display_h = int(m.group(1))
+
+        # Detect Closed Captions in codec private data.
+        # mkvinfo outputs "Codec private type:" followed by hex/ASCII on next lines.
+        # Common CC indicators: EIA-608, EIA-708, HDMV_PGS, HEVC metadata
+        if stripped.startswith('Codec private type'):
+            in_codec_private = True
+            continue
+        if in_codec_private:
+            lower = stripped.lower()
+            if 'eia-608' in lower or 'eia-708' in lower:
+                has_cc = True
+            elif 'hdmv_pgs_subtitle' in lower or 'hevc_metadata' in lower:
+                has_cc = True
+            # Stop scanning codec_private when hit a new top-level field
+            if not stripped.startswith((' ', '\t')) and 'Codec private' not in stripped:
+                in_codec_private = False
 
     # mkvinfo doesn't report raw pixel dimensions directly — fall back to mkvmerge -i
     for line in lines:
@@ -339,6 +368,9 @@ def probe_mkv(mkv_path):
         'video_track_ids': video_track_ids,
         'subtitle_track_ids': subtitle_track_ids,
         'total_tracks': total_tracks,
+        'has_cc': has_cc,
+        'actual_display_w': actual_display_w or 0,
+        'actual_display_h': actual_display_h or 0,
     }, None
 
 
@@ -685,11 +717,13 @@ class App:
         self.txt.bind("<Button-1>", self._on_text_click)
 
         # ── Info bar ─────────────────────────────────────────────────
-        self.info_var = tk.StringVar(value=None)
+        self.info_var = tk.StringVar(value="")
         self.info_lbl = tk.Label(root, textvariable=self.info_var,
                                  font=("Segoe UI", 9), bg=BG, fg=MUTED, anchor="w")
         self.info_lbl.pack(fill="x", padx=16, pady=(0, 4))
 
+        # Initial status — binary check since no files yet.
+        self._update_info()
 
         # ── Mode toggle (Batch / Individual) ─────────────────────────
         mode_row = tk.Frame(root, bg=BG)
@@ -722,57 +756,73 @@ class App:
 
         # DAR uses a tk.StringVar with textvariable on the Entry.
         # trace_add fires on BOTH user typing AND programmatic .set() calls.
-        # To capture per-file settings we need saving in the trace, but we must
-        # skip saving during file restoration (programmatic control updates).
-        self._dar_last_valid = "16:9"  # track last valid value for reverting invalid input
+        # We save per-file settings in the trace, skipping during file restoration.
+        self._dar_last_valid = "16:9"  # track last valid DAR for reverting invalid input
         self._dar_reverting = False    # guard against re-entrant trace callbacks on DAR validation
         self._restoring_file = False   # set around file restoration to skip per-file save
 
-        def _dar_trace(*_args):
-            """Trace callback on dar_str — validates and saves per-file settings.
-
-            Skips save during file restoration (_restoring_file flag) to avoid
-            capturing intermediate control state as a per-file override.
-            """
-            if self._dar_reverting:
-                return  # skip — reverting invalid DAR, don't validate or save
-            if self._restoring_file:
-                return  # skip — restoring controls for another file, not user input
-
-            val = self.dar_str.get()
-
-            # Validate: digits, colons, slashes only; must contain a separator
+        def _dar_validate(val):
+            """Validate a DAR value. Returns True if valid (complete or partial typing)."""
+            if not val:
+                return False
             sep = re.search(r'[:/]', val)
             if sep:
                 left, right = val[:sep.start()], val[sep.end():]
                 if not left or not right:
-                    return  # partial (e.g. "16:" or ":9") — valid for typing
+                    return True  # partial typing (e.g. "16:" or ":9")
                 if all(c.isdigit() for c in left) and all(c.isdigit() for c in right):
                     self._dar_last_valid = val
-                    self._save_current_file_settings()
-                    return
+                    return True
             else:
-                # No separator yet — still valid partial (e.g. "16")
-                if val and all(c.isdigit() for c in val):
-                    self._save_current_file_settings()
-                    return
+                if all(c.isdigit() for c in val):
+                    return True
+            return False
 
-            # Invalid input — revert dar_str to last valid value
-            try:
-                self._dar_reverting = True
-                self.dar_str.set(self._dar_last_valid)
-            finally:
-                self._dar_reverting = False
+        def _dar_trace(*_args):
+            """Trace callback on dar_str — validates and saves per-file settings.
+
+            IMPORTANT: We DO NOT restore dar_str via after_idle here. When the user
+            highlights all text and types, tkinter's textvariable sync updates dar_str
+            synchronously during key processing, but by the time after_idle fires it has
+            already synced from the Entry — so attempting to restore "16:9" conflicts with
+            what the user is typing. Instead we only validate and save for valid values;
+            invalid input (like "abc") stays in the entry and is caught on blur or process.
+            """
+            if self._dar_reverting or self._restoring_file:
+                return
+
+            val = self.dar_str.get()
+
+            # Validate and save immediately for valid values (complete or partial typing)
+            if _dar_validate(val):
+                self._save_current_file_settings()
+                return
+
+            # For empty/invalid — just update last_valid and return without restoring.
+            # The user might still be typing; any remaining invalid value is caught on blur.
+            self._dar_last_valid = val if val else self._dar_last_valid
 
         self.dar_str = tk.StringVar(value="16:9")
-        self.dar_str.trace_add('write', _dar_trace)  # validation + save (guarded by _restoring_file)
-
         self.dar_entry = ttk.Entry(dar_row, style="DAR.TEntry", textvariable=self.dar_str, width=8)
         self.dar_entry.pack(side="left", padx=(6, 0))
 
         def _select_dar(_event=None):
             self.dar_entry.selection_range(0, "end")
         self.dar_entry.bind("<FocusIn>", _select_dar)
+
+        def _on_dar_focus_out(_event=None):
+            """Validate DAR on blur — revert to default if invalid."""
+            val = self.dar_str.get()
+            if val and _dar_validate(val):
+                self._save_current_file_settings()
+            elif val:
+                # Invalid value — revert to last valid
+                self._dar_reverting = True
+                try:
+                    self.dar_str.set(self._dar_last_valid)
+                finally:
+                    self._dar_reverting = False
+        self.dar_entry.bind("<FocusOut>", _on_dar_focus_out)
 
         # Spacer
         tk.Label(dar_row, text="", bg=BG, width=2).pack(side="left")
@@ -1008,6 +1058,7 @@ class App:
         self.selected_file_index = -1
         self.file_settings.clear()
         self._global_audio_sel = None
+        self.dar_str.set("16:9")
         self.audio_var.set("Keep All")
         self.audio_combo.config(values=("Keep All",))
         self._audio_track_data = {"Keep All": None}
@@ -1022,8 +1073,20 @@ class App:
             self.proc_btn.config(state="disabled")
 
     def _update_info(self):
-        """Update the info bar — shows file count."""
-        self.info_var.set(f"Files: {len(self.file_list)}")
+        """Update the info bar — shows binary status when no files, file count otherwise."""
+        if self.file_list:
+            self.info_var.set(f"Files: {len(self.file_list)}")
+            self.info_lbl.config(fg="#565f89")
+        else:
+            found = sum(1 for b in ("mkvinfo", "mkvmerge", "mkvpropedit", "ffmpeg") if _mkv_exe(b) is not None)
+            missing = 4 - found
+            if missing == 0:
+                self.info_var.set(f"All {found} binaries found")
+                self.info_lbl.config(fg="#9ece6a")
+            else:
+                names = [b for b in ("mkvinfo", "mkvmerge", "mkvpropedit", "ffmpeg") if _mkv_exe(b) is None]
+                self.info_var.set(f"Missing: {', '.join(names)}")
+                self.info_lbl.config(fg="#f7768e")
 
     def _pick_output(self):
         d = filedialog.askdirectory(title="Choose Output Directory")
@@ -1752,7 +1815,7 @@ class App:
     # -- Tk threading helpers --
     # -- audio track probing --
     def _probe_and_populate_audio(self):
-        """Probe the first file in the list for audio tracks and update the dropdown."""
+        """Probe the first file for audio tracks and display DAR/Sub/CC info."""
         if not self.file_list:
             self.root.after(0, lambda: (
                 self.audio_var.set("Keep All"),
@@ -1764,9 +1827,8 @@ class App:
         if not os.path.isfile(mkv_path):
             return
 
+        # Probe audio tracks
         audio_tracks = probe_audio_tracks(mkv_path)
-
-        # Build options with embedded track ID as data
         options = [("Keep All", None)]  # (display_label, audio_index)
         for track in audio_tracks:
             lang = (track.get('language') or '').lower()
@@ -1775,21 +1837,57 @@ class App:
             if not lang or lang in ('und', 'unk'):
                 display = f"Track #{tid}"
             elif len(lang) == 2:
-                # Look up ISO 639-1 code → full name; fall back to uppercase if unknown
                 display = f"Track #{tid} ({_ISO_639_1_TO_NAME.get(lang, lang.upper())})"
             else:
-                # Try 3-letter ISO 639-2/3 mapping first; fall back to showing raw code
                 name = (_ISO_639_2_TO_NAME.get(lang) or lang.title()) if len(lang) == 3 else lang.upper()
                 display = f"Track #{tid} ({name})"
 
             options.append((display, tid))
 
+        # Also probe for DAR / Subtitle / CC info (replaces the old probe_mkv usage).
+        info_dict, err = probe_mkv(mkv_path)
+        file_count = len(self.file_list)
+
+        if info_dict and not err:
+            # Build DAR string from actual display dimensions, fallback to pixel resolution.
+            dar_str = "n/a"
+            ad_w = info_dict.get('actual_display_w', 0)
+            ad_h = info_dict.get('actual_display_h', 0)
+            if ad_w > 0 and ad_h > 0:
+                g = self._gcd_dar(ad_w, ad_h)
+                dar_str = f"{ad_w // g}:{ad_h // g}"
+            elif info_dict.get('width', 0) > 0 and info_dict.get('height', 0) > 0:
+                pw = info_dict['width']
+                ph = info_dict['height']
+                g = self._gcd_dar(pw, ph)
+                dar_str = f"{pw // g}:{ph // g} (from {pw}x{ph})"
+
+            subs_found = bool(info_dict.get('subtitle_track_ids'))
+            cc_found = info_dict.get('has_cc', False)
+
+            # Update status line below file list with DAR / Sub / CC info.
+            parts = [f"{file_count} file(s) added"]
+            if dar_str != "n/a":
+                parts.append(f"Current DAR: {dar_str}")
+            parts.append(f"Has Subtitles: {'Yes' if subs_found else 'No'}")
+            parts.append(f"Has CC: {'Yes' if cc_found else 'No'}")
+            self.info_var.set("  |  ".join(parts))
+        else:
+            # Probe failed — show only file count + audio.
+            self.info_var.set(f"{file_count} file(s) added (probe: {err})")
+
+        # Update audio combo.
         self.root.after(0, lambda: (
             self.audio_var.set("Keep All"),
             self.audio_combo.config(values=tuple(opt[0] for opt in options))
         ))
-        # Store full data on the widget for lookup during processing
         self._audio_track_data = dict(options)
+
+    def _gcd_dar(self, a, b):
+        """Compute GCD of two integers (Euclidean algorithm)."""
+        while b:
+            a, b = b, a % b
+        return a
 
     def _btn_mode(self, text, value, master, inactive=False):
         """Create one half of the Batch/Individual toggle.
