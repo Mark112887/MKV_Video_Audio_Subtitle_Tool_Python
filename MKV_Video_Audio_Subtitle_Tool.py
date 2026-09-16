@@ -713,7 +713,7 @@ class App:
     def __init__(self, root):
         self.root = root
         self.root.title("MKV Video Audio & Subtitle Tool")
-        self.root.geometry("850x530")
+        self.root.geometry("850x560")
         self.root.resizable(False, False)
         self.root.configure(bg="#1a1b26")
         self.file_list = []
@@ -781,6 +781,10 @@ class App:
         self.info_lbl = tk.Label(root, textvariable=self.info_var,
                                  font=("Segoe UI", 9), bg=BG, fg=MUTED, anchor="w")
         self.info_lbl.pack(fill="x", padx=16, pady=(0, 4))
+
+        # Binary status label — visible only when no files present.
+        self.bin_status_lbl = tk.Label(root, font=("Segoe UI", 9), bg=BG, anchor="w")
+        self.bin_status_lbl.pack(fill="x", padx=16, pady=(0, 2))
 
         # Initial status — binary check since no files yet.
         self._update_info()
@@ -1131,22 +1135,60 @@ class App:
         self.over_text.config(text="Overall: 0%")
         if not self.processing:
             self.proc_btn.config(state="disabled")
+        self._update_info()
 
     def _update_info(self):
         """Update the info bar — shows binary status when no files, file count otherwise."""
         if self.file_list:
+            # Files present — show file count on main line, hide binary status.
             self.info_var.set(f"Files: {len(self.file_list)}")
             self.info_lbl.config(fg="#565f89")
         else:
+            # No files — "Processing complete." after batch, blank at idle startup.
+            if getattr(self, '_batch_ran', False):
+                self.info_var.set("Processing complete.")
+            else:
+                self.info_var.set("")
+            self.info_lbl.config(fg="#c0caf5")
             found = sum(1 for b in ("mkvinfo", "mkvmerge", "mkvpropedit", "ffmpeg") if _mkv_exe(b) is not None)
             missing = 4 - found
             if missing == 0:
-                self.info_var.set(f"All {found} binaries found")
-                self.info_lbl.config(fg="#9ece6a")
+                self.bin_status_lbl.config(text="All 4 binaries found", fg="#9ece6a")
             else:
                 names = [b for b in ("mkvinfo", "mkvmerge", "mkvpropedit", "ffmpeg") if _mkv_exe(b) is None]
-                self.info_var.set(f"Missing: {', '.join(names)}")
-                self.info_lbl.config(fg="#f7768e")
+                self.bin_status_lbl.config(text=f"Missing: {', '.join(names)}", fg="#f7768e")
+            # bin_status_lbl stays packed — it's always visible when no files are present.
+            found = sum(1 for b in ("mkvinfo", "mkvmerge", "mkvpropedit", "ffmpeg") if _mkv_exe(b) is not None)
+            missing = 4 - found
+            if missing == 0:
+                self.bin_status_lbl.config(text="All 4 binaries found", fg="#9ece6a")
+            else:
+                names = [b for b in ("mkvinfo", "mkvmerge", "mkvpropedit", "ffmpeg") if _mkv_exe(b) is None]
+                self.bin_status_lbl.config(text=f"Missing: {', '.join(names)}", fg="#f7768e")
+            found = sum(1 for b in ("mkvinfo", "mkvmerge", "mkvpropedit", "ffmpeg") if _mkv_exe(b) is not None)
+            missing = 4 - found
+            if missing == 0:
+                self.bin_status_lbl.config(text="All 4 binaries found", fg="#9ece6a")
+            else:
+                names = [b for b in ("mkvinfo", "mkvmerge", "mkvpropedit", "ffmpeg") if _mkv_exe(b) is None]
+                self.bin_status_lbl.config(text=f"Missing: {', '.join(names)}", fg="#f7768e")
+            # bin_status_lbl is packed at init; only pack if not already visible.
+            try:
+                self.bin_status_lbl.pack_info()
+            except tk.TclError:
+                self.bin_status_lbl.pack(fill="x", padx=16, pady=(0, 2))
+            found = sum(1 for b in ("mkvinfo", "mkvmerge", "mkvpropedit", "ffmpeg") if _mkv_exe(b) is not None)
+            missing = 4 - found
+            if missing == 0:
+                self.bin_status_lbl.config(text="All 4 binaries found", fg="#9ece6a")
+            else:
+                names = [b for b in ("mkvinfo", "mkvmerge", "mkvpropedit", "ffmpeg") if _mkv_exe(b) is None]
+                self.bin_status_lbl.config(text=f"Missing: {', '.join(names)}", fg="#f7768e")
+            # bin_status_lbl is packed at init; only pack if not already visible.
+            try:
+                bbox = self.bin_status_lbl.pack_info()
+            except tk.TclError:
+                self.bin_status_lbl.pack(fill="x", padx=16, pady=(0, 2))
 
     def _pick_output(self):
         d = filedialog.askdirectory(title="Choose Output Directory")
@@ -2007,7 +2049,6 @@ class App:
             self.root.after(0, lambda: self.cur_text.config(text="Current File: 0%"))
             self.root.after(0, lambda: self.over_text.config(text=f"Overall: 0%", fg="#7aa2f7"))
             self.root.after(0, lambda: self._append_text("\n═══ no action necessary ═══\n", color="#565f89"))
-            self.root.after(0, lambda: self.info_var.set("No action necessary"))
         else:
             # Final canvas updates (100% overall)
             ow = max(2, (self.over_canvas.winfo_width() - 2) if self.over_canvas.winfo_width() > 0 else 518)
@@ -2026,6 +2067,8 @@ class App:
         self._proc_state = {}
         self._mux_proc = None
         self.processing = False
+        self._batch_ran = True  # mark that a batch has run so idle state shows "Processing complete."
+        self._update_info()     # updates info_var + green binary status
         if fail > 0:
             self.root.after(0, lambda: self.proc_btn.config(state="normal", bg="#e5a536"))
         else:
