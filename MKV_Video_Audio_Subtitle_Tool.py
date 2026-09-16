@@ -1322,6 +1322,40 @@ class App:
                     audio_sel = self._global_audio_sel
                     delete_originals = self.delete_originals_var.get()
 
+                # ─── Probe this file for validation (compare against current state) ───
+                info_dict, probe_err = None, None
+                try:
+                    info_dict, probe_err = probe_mkv(fp)
+                except Exception:
+                    pass
+
+                has_subtitles = bool(info_dict.get('subtitle_track_ids')) if info_dict else False
+                has_cc_from_file = info_dict.get('has_cc', False) if info_dict else False
+                cur_dar_w = (info_dict.get('actual_display_w') or info_dict.get('width')) if info_dict else 0
+                cur_dar_h = (info_dict.get('actual_display_h') or info_dict.get('height')) if info_dict else 0
+
+                # ─── Subtitle validation: skip -S if no subs exist ───
+                validation_notes = []
+                if remove_subs and not has_subtitles:
+                    remove_subs = False
+                    validation_notes.append("Subtitles: none present (skipped)")
+
+                # ─── DAR validation: compare against desired ───
+                skip_dar = False
+                if cur_dar_w > 0 and cur_dar_h > 0:
+                    try:
+                        if self._matches_dar(cur_dar_w, cur_dar_h, dar_str):
+                            skip_dar = True
+                            validation_notes.append(f"DAR already {cur_dar_w}:{cur_dar_h} (skipped)")
+                    except ValueError:
+                        pass  # malformed dar_str — will be caught by parse_dar below anyway
+
+                # ─── CC validation flag for later FFmpeg step ───
+                skip_cc = False
+                if remove_cc and not has_cc_from_file:
+                    skip_cc = True
+                    validation_notes.append("CC: none present (skipped)")
+
                 fname = os.path.basename(fp)
                 output_path = os.path.join(self.output_dir,
                                            os.path.splitext(fname)[0] + '.mkv')
@@ -1332,12 +1366,14 @@ class App:
                     merge_args.append('-S')
                 merge_args.append(fp)
 
-                # Store per-file state
+                # Store per-file state with validation flags
                 s.update({
                     'fp': fp, 'fname': fname, 'dar_str': dar_str,
                     'remove_subs': remove_subs, 'remove_cc': remove_cc,
                     'audio_sel': audio_sel, 'delete_originals': delete_originals,
                     'output_path': output_path, 'merge_args': merge_args,
+                    'skip_dar': skip_dar, 'skip_cc': skip_cc,
+                    'validation_notes': validation_notes,
                 })
 
                 # UI updates on main thread
@@ -1614,8 +1650,8 @@ class App:
                     self._process_file_result(False, "mkvmerge produced no output file", cb_ctx=mux_cb_ctx)
                     return
 
-                # ─── FFmpeg CC removal step ───
-                if s.get('remove_cc'):
+                # ─── FFmpeg CC removal step (only if CC actually exists) ───
+                if s.get('remove_cc') and not s.get('skip_cc'):
                     ffmpeg = _get_ffmpeg()
                     if ffmpeg is None:
                         try:
@@ -1706,56 +1742,81 @@ class App:
                         self._process_file_result(False, f"CC rename failed: {exc}", cb_ctx=mux_cb_ctx)
                         return
 
-                # ─── mkvpropedit step ───
-                dar_w, dar_h = parse_dar(s['dar_str'])
-                mkvpropedit = _get_mkvpropedit()
-                mkv_prop_start = _time.time()
-                mux_cb('mkvpropedit', 99, "Setting metadata…")
-
-                # Give Tk time to render the initial progress state before running
-                mkv_est = max(1, (_time.time() - mkv_prop_start) * 3) if mkv_prop_start else 1
-                sleep_target = max(0, min(0.8, mkv_est - (_time.time() - mkv_prop_start)))
-                while sleep_target > 0.02:
-                    elapsed = _time.time() - mkv_prop_start
-                    pct_pe = min(96, int((elapsed / mkv_est) * 100)) if mkv_est > 0 else 0
-                    mux_cb('mkvpropedit', pct_pe, f"Setting metadata… {elapsed:.1f}s")
-                    self.root.update_idletasks()
-                    _time.sleep(0.05)
-                    sleep_target = max(0, min(0.8, mkv_est - (_time.time() - mkv_prop_start)))
-
-                mux_cb('done', 100)
-                if mkvpropedit is None:
-                    try:
-                        os.remove(output_path)
-                    except OSError:
-                        pass
-                    self._process_file_result(False, "mkvpropEdit.exe not found.", cb_ctx=mux_cb_ctx)
-                    return
-
-                rc_pe, out_text_pe = run_mkvtl(
-                    [mkvpropedit, output_path] +
-                    ['--edit', 'track:v1', '--set', f'display-width={dar_w}',
-                     '--set', f'display-height={dar_h}', '--set', 'display-unit=3'],
-                    timeout=60)
-
-                if rc_pe != 0:
-                    try:
-                        os.remove(output_path)
-                    except OSError:
-                        pass
-                    self._process_file_result(False,
-                                              f"mkvpropedit failed (rc={rc_pe}): {out_text_pe}",
-                                              cb_ctx=mux_cb_ctx)
-                    return
-
-                # Build success message
-                msg_parts = [f"Display Aspect Ratio Set to {dar_w}:{dar_h}"]
-                if s['remove_subs']:
-                    msg_parts.append("Subtitles Removed: Yes")
+                # ─── mkvpropedit step (DAR) ───
+                if s.get('skip_dar'):
+                    # DAR already matches — skip mkvpropedit
+                    mux_cb('done', 100)
                 else:
-                    msg_parts.append("Subtitles Removed: No")
-                if s['remove_cc']:
-                    msg_parts.append("Closed Captions Removed: Yes")
+                    dar_w, dar_h = parse_dar(s['dar_str'])
+                    mkvpropedit = _get_mkvpropedit()
+                    if mkvpropedit is None:
+                        try:
+                            os.remove(output_path)
+                        except OSError:
+                            pass
+                        self._process_file_result(False, "mkvpropEdit.exe not found.", cb_ctx=mux_cb_ctx)
+                        return
+
+                    mkv_prop_start = _time.time()
+                    mux_cb('mkvpropedit', 99, "Setting metadata…")
+
+                    # Give Tk time to render the initial progress state before running
+                    mkv_est = max(1, (_time.time() - mkv_prop_start) * 3) if mkv_prop_start else 1
+                    sleep_target = max(0, min(0.8, mkv_est - (_time.time() - mkv_prop_start)))
+                    while sleep_target > 0.02:
+                        elapsed = _time.time() - mkv_prop_start
+                        pct_pe = min(96, int((elapsed / mkv_est) * 100)) if mkv_est > 0 else 0
+                        mux_cb('mkvpropedit', pct_pe, f"Setting metadata… {elapsed:.1f}s")
+                        self.root.update_idletasks()
+                        _time.sleep(0.05)
+                        sleep_target = max(0, min(0.8, mkv_est - (_time.time() - mkv_prop_start)))
+
+                    mux_cb('done', 100)
+
+                    rc_pe, out_text_pe = run_mkvtl(
+                        [mkvpropedit, output_path] +
+                        ['--edit', 'track:v1', '--set', f'display-width={dar_w}',
+                         '--set', f'display-height={dar_h}', '--set', 'display-unit=3'],
+                        timeout=60)
+
+                    if rc_pe != 0:
+                        try:
+                            os.remove(output_path)
+                        except OSError:
+                            pass
+                        self._process_file_result(False,
+                                                  f"mkvpropedit failed (rc={rc_pe}): {out_text_pe}",
+                                                  cb_ctx=mux_cb_ctx)
+                        return
+
+                # Build concise success message.
+                msg_parts = []
+
+                if s.get('skip_dar'):
+                    msg_parts.append("DAR Already Matches Desired Value")
+                else:
+                    dar_w, dar_h = parse_dar(s['dar_str'])
+                    msg_parts.append(f"Display Aspect Ratio Set to {dar_w}:{dar_h}")
+
+                # Subtitles — three states: removed / kept / not present.
+                has_sub_note = any('Subtitles' in n for n in s.get('validation_notes', []))
+                if s['remove_subs'] and not has_sub_note:
+                    msg_parts.append("Subtitles: Removed")
+                elif has_sub_note:
+                    msg_parts.append("Subtitles: Not Present")
+                else:
+                    msg_parts.append("Subtitles: Not Removed")
+
+                # Captions — three states: removed / kept / not present.
+                has_cc_note = any('CC' in n for n in s.get('validation_notes', []))
+                if s['remove_cc'] and not has_cc_note:
+                    msg_parts.append("Closed Captions: Removed")
+                elif has_cc_note:
+                    msg_parts.append("Closed Captions: Not Present")
+                else:
+                    msg_parts.append("Closed Captions: Not Removed")
+
+                # Audio selection (optional, shown only when a track was kept).
                 if s['audio_sel'] is not None:
                     msg_parts.append(f"Audio Kept: Track #{s['audio_sel']}")
 
@@ -1948,6 +2009,11 @@ class App:
         while b:
             a, b = b, a % b
         return a
+
+    def _matches_dar(self, cur_w, cur_h, dar_str):
+        """Check if current display dimensions match the desired DAR string."""
+        dw, dh = parse_dar(dar_str)
+        return cur_w * dh == cur_h * dw
 
     def _btn_mode(self, text, value, master, inactive=False):
         """Create one half of the Batch/Individual toggle.
